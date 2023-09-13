@@ -1,6 +1,10 @@
 package controller
 
 import (
+	"encoding/json"
+	"fmt"
+	"os"
+
 	"github.com/answerdev/answer/internal/base/handler"
 	"github.com/answerdev/answer/internal/base/middleware"
 	"github.com/answerdev/answer/internal/base/reason"
@@ -16,6 +20,7 @@ import (
 	"github.com/answerdev/answer/internal/service/user_notification_config"
 	"github.com/answerdev/answer/pkg/checker"
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/segmentfault/pacman/errors"
 	"github.com/segmentfault/pacman/log"
 )
@@ -28,6 +33,17 @@ type UserController struct {
 	emailService                  *export.EmailService
 	siteInfoCommonService         siteinfo_common.SiteInfoCommonService
 	userNotificationConfigService *user_notification_config.UserNotificationConfigService
+}
+
+type UserJwt struct {
+	ID    string `json:"id"`
+	Email string `json:"email"`
+	Type  string `json:"type" binding:"required,oneof=signup password"`
+	jwt.RegisteredClaims
+}
+
+type AccessTokenRequest struct {
+	AccessToken string `json:"accessToken"`
 }
 
 // NewUserController new controller
@@ -213,6 +229,100 @@ func (uc *UserController) UserLogout(ctx *gin.Context) {
 	_ = uc.authService.RemoveUserCacheInfo(ctx, accessToken)
 	_ = uc.authService.RemoveAdminUserCacheInfo(ctx, accessToken)
 	handler.HandleResponse(ctx, nil, nil)
+}
+
+// UserLoginByJwt godoc
+// @Summary UserLoginByJwt
+// @Description UserLoginByJwt
+// @Tags User
+// @Accept string
+// @Produce json
+// @Param data body string true "jwt"
+// @Success 200 {object} handler.RespBody{data=schema.UserLoginResp}
+// @Router /answer/api/v1/user/login/jwt [post]
+func (uc *UserController) UserLoginByJwt(ctx *gin.Context) {
+	decoder := json.NewDecoder(ctx.Request.Body)
+	var t AccessTokenRequest
+	err := decoder.Decode(&t)
+	if err != nil {
+		fmt.Print(err.Error())
+	}
+
+	accessToken := t.AccessToken
+	fmt.Println("access token: " + accessToken)
+	if len(accessToken) == 0 {
+		handler.HandleResponse(ctx, nil, nil)
+		return
+	}
+
+	// user logged in, just response userInfo
+	userInfo, _ := uc.authService.GetUserCacheInfo(ctx, accessToken)
+	if userInfo != nil {
+		fmt.Println("user info: " + userInfo.UserID)
+		handler.HandleResponse(ctx, nil, userInfo)
+		return
+	}
+	fmt.Println("user info is nil")
+
+	jwtSecret := os.Getenv("JWT_SECRET")
+	token, _ := jwt.ParseWithClaims(accessToken, &UserJwt{}, func(token *jwt.Token) (interface{}, error) {
+		return []byte(jwtSecret), nil
+	})
+	claims, ok := token.Claims.(*UserJwt)
+	fmt.Println("claims: " + claims.Email + "; Valid: " + fmt.Sprintf("%v", token.Valid))
+	if ok && !token.Valid {
+		handler.HandleResponse(ctx, errors.Unauthorized(reason.UnauthorizedError), nil)
+		return
+	}
+
+	has, err := uc.userService.UserEmailHas(ctx, claims.Email)
+	if err != nil {
+		fmt.Println("get user info by email error: ", err)
+		handler.HandleResponse(ctx, err, nil)
+		return
+	}
+
+	// not exists, register new user
+	if has {
+		req := &schema.UserEmailLogin{}
+		req.Email = claims.Email
+		req.Pass = uc.GenerateJwtPassword(claims.Email)
+		// hack for first admin user
+		if claims.Email == os.Getenv("FIRST_ADMIN_EMAIL") {
+			req.Pass = os.Getenv("FIRST_ADMIN_PASS")
+		}
+		resp, err := uc.userService.EmailLogin(ctx, req)
+		if err != nil {
+			fmt.Println("login error: ", err)
+			handler.HandleResponse(ctx, err, nil)
+			return
+		}
+		fmt.Println("login success")
+		handler.HandleResponse(ctx, nil, resp)
+		return
+	}
+
+	fmt.Println("not found user info, register new user")
+	req := &schema.UserRegisterReq{}
+	req.Name = claims.Email
+	req.Email = claims.Email
+	req.Pass = uc.GenerateJwtPassword(claims.Email)
+	req.IP = ctx.ClientIP()
+	resp, errFields, err := uc.userService.UserRegisterByEmail(ctx, req)
+	if len(errFields) > 0 {
+		for _, field := range errFields {
+			field.ErrorMsg = translator.
+				Tr(handler.GetLang(ctx), field.ErrorMsg)
+		}
+		handler.HandleResponse(ctx, err, errFields)
+	} else {
+		fmt.Println("register new user success")
+		handler.HandleResponse(ctx, err, resp)
+	}
+}
+
+func (uc *UserController) GenerateJwtPassword(email string) string {
+	return email + "@hackquest.io"
 }
 
 // UserRegisterByEmail godoc
